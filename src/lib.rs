@@ -49,6 +49,10 @@ fn impl_auto_accessor(mut s: Structure) -> TokenStream {
 
             let ident_str = ident.to_string();
 
+            if ident_str.starts_with('_') {
+                continue;
+            }
+
             if done.contains(&ident_str) {
                 continue;
             } else {

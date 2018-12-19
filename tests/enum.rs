@@ -38,6 +38,7 @@ pub enum Test<T: Clone> {
         w: Vec<bool>,
         o: Vec<char>,
         e: Vec<&'static str>,
+        __ignored: bool,
     },
 }
 
