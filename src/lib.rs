@@ -228,6 +228,7 @@ fn impl_auto_accessor(mut s: Structure) -> TokenStream {
 
                 field_accessors.push(quote! {
                     #(#docs)*
+                    #[inline]
                     pub fn #ident(&self) -> #ty {
                         match *self { #body }
                     }
@@ -267,6 +268,7 @@ fn impl_auto_accessor(mut s: Structure) -> TokenStream {
 
         quote! {
             #[doc = #doc]
+            #[inline]
             pub fn #method(&self) -> bool {
                 match *self { #body }
             }
