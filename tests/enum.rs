@@ -13,6 +13,7 @@ pub enum Test<T: Clone> {
         #[access(clone)]
         w: Vec<bool>,
         o: Vec<char>,
+        ignored: bool,
     },
     B {
         /// Also here
@@ -24,6 +25,7 @@ pub enum Test<T: Clone> {
         n: Option<Vec<i32>>,
         w: Vec<bool>,
         o: Vec<char>,
+        ignored: bool,
     },
     C {
         /// One
@@ -38,7 +40,9 @@ pub enum Test<T: Clone> {
         w: Vec<bool>,
         o: Vec<char>,
         e: Vec<&'static str>,
-        __ignored: bool,
+        _ignored: bool,
+        #[access(ignore)]
+        ignored: bool,
     },
 }
 

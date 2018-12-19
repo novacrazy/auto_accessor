@@ -44,13 +44,13 @@ fn impl_auto_accessor(mut s: Structure) -> TokenStream {
 
         let mut field_accessors = Vec::new();
 
-        for field in fields.iter() {
+        'skip_field: for field in fields.iter() {
             let ident: Ident = field.ident.clone().unwrap();
 
             let ident_str = ident.to_string();
 
             if ident_str.starts_with('_') {
-                continue;
+                continue 'skip_field;
             }
 
             if done.contains(&ident_str) {
@@ -94,6 +94,8 @@ fn impl_auto_accessor(mut s: Structure) -> TokenStream {
                                                         clonable = true;
                                                     } else if ident == "copy" {
                                                         copyable = true;
+                                                    } else if ident == "ignore" {
+                                                        continue 'skip_field;
                                                     }
                                                 }
                                                 _ => continue,
