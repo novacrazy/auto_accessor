@@ -226,8 +226,6 @@ fn impl_auto_accessor(mut s: Structure) -> TokenStream {
                         match *self { #body }
                     }
                 });
-
-                field_accessors.push(quote!());
             }
         }
 

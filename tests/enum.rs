@@ -9,6 +9,8 @@ pub enum Test<T: Clone> {
         l: char,
         n: Option<Vec<i32>>,
         #[access(clone)]
+        j: Option<Vec<i32>>,
+        #[access(clone)]
         w: Vec<bool>,
         o: Vec<char>,
     },
