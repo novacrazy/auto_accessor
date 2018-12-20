@@ -1,39 +1,146 @@
+extern crate proc_macro;
+extern crate proc_macro2;
+#[macro_use]
 extern crate quote;
 extern crate syn;
-#[macro_use]
-extern crate synstructure;
-extern crate proc_macro2;
+
+use std::iter;
 
 use proc_macro2::{Literal, Span, TokenStream};
-use syn::spanned::Spanned;
+use syn::DeriveInput;
 use syn::{
-    AngleBracketedGenericArguments, AttrStyle, Fields, GenericArgument, Ident, Lit, Meta,
-    NestedMeta, PathArguments, Type, TypePath,
+    AngleBracketedGenericArguments, AttrStyle, Data, DataEnum, DataStruct, Fields, GenericArgument,
+    Ident, Lit, Meta, NestedMeta, PathArguments, Type, TypePath,
 };
-use synstructure::{BindStyle, Structure};
 
-decl_derive!([AutoAccessor, attributes(access)] => impl_auto_accessor);
+#[proc_macro_derive(AutoAccessor, attributes(access))]
+pub fn my_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    impl_auto_accessor(syn::parse(input).expect(concat!(
+        "Failed to parse input to `#[derive(AutoAccessor)]`"
+    )))
+    .into()
+}
 
-fn impl_auto_accessor(mut s: Structure) -> TokenStream {
-    s.binding_name(|bi, i| {
-        bi.ident
-            .clone()
-            .unwrap_or_else(|| Ident::new(&format!("binding{}", i), bi.ident.span()))
+fn impl_auto_accessor(input: DeriveInput) -> TokenStream {
+    match input.data {
+        Data::Struct(ref s) => impl_struct_auto_accessor(&input, s),
+        Data::Enum(ref e) => impl_enum_auto_accessor(&input, e),
+        _ => panic!("AutoAccessor isn't available for non-Enum/Struct types"),
+    }
+}
+
+fn impl_struct_auto_accessor(input: &DeriveInput, data: &DataStruct) -> TokenStream {
+    let DeriveInput {
+        ident: ref name, ..
+    } = input;
+
+    let is_struct = match data.fields {
+        Fields::Named(_) => true,
+        _ => false,
+    };
+
+    if !is_struct {
+        panic!("AutoAccessor only works on named structures");
+    }
+
+    let accessors = data.fields.iter().filter_map(|field| {
+        let ident = field.ident.as_ref().unwrap();
+        let vis = &field.vis;
+
+        if ident.to_string().starts_with('_') {
+            return None;
+        }
+
+        let ty = &field.ty;
+
+        let mut clonable = false;
+        let mut copyable = false;
+
+        let mut docs = Vec::new();
+
+        for attr in &field.attrs {
+            if attr.style != AttrStyle::Outer {
+                continue;
+            }
+
+            match attr.parse_meta().ok() {
+                Some(Meta::List(ref meta_list)) if meta_list.ident == "access" => {
+                    for meta in &meta_list.nested {
+                        match *meta {
+                            NestedMeta::Meta(Meta::Word(ref ident)) => {
+                                if ident == "clone" {
+                                    clonable = true;
+                                } else if ident == "copy" {
+                                    copyable = true;
+                                } else if ident == "ignore" {
+                                    return None;
+                                }
+                            }
+                            _ => continue,
+                        }
+                    }
+                }
+                Some(Meta::NameValue(ref meta)) if meta.ident == "doc" => {
+                    if !docs.contains(&attr) {
+                        docs.push(attr);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let flattened_type = flatten(ty);
+
+        copyable = copyable
+            || flattened_type
+                .as_ref()
+                .map(is_trivially_copyable)
+                .unwrap_or(false)
+            || is_trivially_copyable(ty);
+
+        let ty = match (copyable || clonable, &flattened_type) {
+            (true, Some(ty)) => quote!(Option<#ty>),
+            (false, Some(ty)) => quote!(Option<&#ty>),
+            (true, None) => quote!(#ty),
+            (false, None) => quote!(&#ty),
+        };
+
+        let body = match (copyable, clonable, &flattened_type) {
+            (true, _, _) => quote!(self.#ident),
+            (_, true, _) => quote!(self.#ident.clone()),
+            (false, false, Some(_)) => quote!(self.#ident.as_ref()),
+            (false, false, None) => quote!(&self.#ident),
+        };
+
+        Some(quote! {
+            #(#docs)*
+            #[inline]
+            #vis fn #ident(&self) -> #ty { #body }
+        })
     });
 
-    let name = &s.ast().ident;
+    let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
 
-    let (impl_generics, ty_generics, where_clause) = s.ast().generics.split_for_impl();
+    quote! {
+        impl #impl_generics #name #ty_generics #where_clause {
+            #(#accessors)*
+        }
+    }
+}
 
-    let num_variants = s.variants().len();
+fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream {
+    let DeriveInput {
+        ident: ref name,
+        ref vis,
+        ..
+    } = input;
+
+    let num_variants = data.variants.len();
 
     let mut done: Vec<String> = Vec::new();
 
-    // For every enum variant
-    let accessors = s.variants().iter().flat_map(|variant_info| {
-        let fields = variant_info.ast().fields;
-
-        let is_struct = match fields {
+    let accessors = data.variants.iter().flat_map(|variant| {
+        let is_struct = match variant.fields {
             Fields::Named(_) => true,
             _ => false,
         };
@@ -44,7 +151,7 @@ fn impl_auto_accessor(mut s: Structure) -> TokenStream {
 
         let mut field_accessors = Vec::new();
 
-        'skip_field: for field in fields.iter() {
+        'skip_field: for field in variant.fields.iter() {
             let ident: Ident = field.ident.clone().unwrap();
 
             let ident_str = ident.to_string();
@@ -65,12 +172,8 @@ fn impl_auto_accessor(mut s: Structure) -> TokenStream {
 
                 let mut docs = Vec::new();
 
-                // for every variant
-                for other_variant_info in s.variants().iter() {
-                    // for every field of every variant
-                    for other_field in other_variant_info.ast().fields.iter() {
-                        // if current field found,
-                        // check for same-type and increase presence
+                for other_variant in data.variants.iter() {
+                    for other_field in other_variant.fields.iter() {
                         if other_field.ident == field.ident {
                             if other_field.ty != *ty {
                                 panic!("Same-name fields must have the same type!");
@@ -95,6 +198,8 @@ fn impl_auto_accessor(mut s: Structure) -> TokenStream {
                                                     } else if ident == "copy" {
                                                         copyable = true;
                                                     } else if ident == "ignore" {
+                                                        done.push(ident_str);
+
                                                         continue 'skip_field;
                                                     }
                                                 }
@@ -131,12 +236,6 @@ fn impl_auto_accessor(mut s: Structure) -> TokenStream {
 
                 let is_in_all = presence == num_variants;
 
-                // clone structure for use on this field
-                let mut s = s.clone();
-
-                // Don't bother binding other fields
-                s.filter(|bi| bi.ast().ident.as_ref() == Some(&ident));
-
                 /*
                  * Possible combinations:
                  *  If the type was flattened (was an Option):
@@ -163,74 +262,66 @@ fn impl_auto_accessor(mut s: Structure) -> TokenStream {
                  * 8            Return Option<&T>
                  */
 
-                if !is_in_all {
-                    s.filter_variants(|v| {
-                        v.bindings()
-                            .iter()
-                            .any(|bi| bi.ast().ident.as_ref() == Some(&ident))
-                    });
-                }
-
-                let (ty, body) = match (copyable, clonable, is_in_all, flattened_type) {
-                    // variant 1, 2 copy
-                    (true, _, _, Some(ty)) => (
-                        quote!(Option<#ty>),
-                        s.bind_with(|_| BindStyle::Move)
-                            .fold(quote!(None), |_, bi| quote!(#bi)),
-                    ),
-                    // variant 1, 2 clone
-                    (_, true, _, Some(ty)) => (
-                        quote!(Option<#ty>),
-                        s.bind_with(|_| BindStyle::Ref)
-                            .fold(quote!(None), |_, bi| quote!(#bi.as_ref().cloned())),
-                    ),
-                    // variant 3, 4
-                    (false, false, _, Some(ty)) => (
-                        quote!(Option<&#ty>),
-                        s.bind_with(|_| BindStyle::Ref)
-                            .fold(quote!(None), |_, bi| quote!(#bi.as_ref())),
-                    ),
-                    // variant 5 copy
-                    (true, _, true, None) => (
-                        quote!(#ty),
-                        s.bind_with(|_| BindStyle::Move).each(|bi| quote!(#bi)),
-                    ),
-                    // variant 5 clone
-                    (_, true, true, None) => (
-                        quote!(#ty),
-                        s.bind_with(|_| BindStyle::Ref)
-                            .each(|bi| quote!(#bi.clone())),
-                    ),
-                    // variant 6 copy
-                    (true, _, false, None) => (
-                        quote!(Option<#ty>),
-                        s.bind_with(|_| BindStyle::Move)
-                            .fold(quote!(None), |_, bi| quote!(Some(#bi))),
-                    ),
-                    // variant 6 clone
-                    (_, true, false, None) => (
-                        quote!(Option<#ty>),
-                        s.bind_with(|_| BindStyle::Ref)
-                            .fold(quote!(None), |_, bi| quote!(Some(#bi.clone()))),
-                    ),
-                    // variant 7
-                    (_, _, true, None) => (
-                        quote!(&#ty),
-                        s.bind_with(|_| BindStyle::Ref).each(|bi| quote!(#bi)),
-                    ),
-                    // variant 8
-                    (_, _, false, None) => (
-                        quote!(Option<&#ty>),
-                        s.bind_with(|_| BindStyle::Ref)
-                            .fold(quote!(None), |_, bi| quote!(Some(#bi))),
-                    ),
+                let ty = match (copyable || clonable, is_in_all, &flattened_type) {
+                    (true, _, Some(ty)) => quote!(Option<#ty>),
+                    (false, _, Some(ty)) => quote!(Option<&#ty>),
+                    (true, true, None) => quote!(#ty),
+                    (false, true, None) => quote!(&#ty),
+                    (true, false, None) => quote!(Option<#ty>),
+                    (false, false, None) => quote!(Option<&#ty>),
                 };
+
+                let body = data
+                    .variants
+                    .iter()
+                    .filter_map(|variant| {
+                        let v = &variant.ident;
+
+                        let has_binding = variant
+                            .fields
+                            .iter()
+                            .any(|field| field.ident.as_ref() == Some(&ident));
+
+                        if !has_binding {
+                            None
+                        } else {
+                            let borrow = if !copyable { quote!(ref) } else { quote!() };
+
+                            let body = match (copyable, clonable, is_in_all, &flattened_type) {
+                                // variant 1, 2 copy
+                                (true, _, _, Some(_)) => quote!(#ident),
+                                // variant 1, 2 clone
+                                (_, true, _, Some(_)) => quote!(#ident.as_ref().cloned()),
+                                // variant 3, 4
+                                (false, false, _, Some(_)) => quote!(#ident.as_ref()),
+                                // variant 5 copy
+                                (true, _, true, None) => quote!(#ident),
+                                // variant 5 clone
+                                (_, true, true, None) => quote!(#ident.clone()),
+                                // variant 6 copy
+                                (true, _, false, None) => quote!(Some(#ident)),
+                                // variant 6 clone
+                                (_, true, false, None) => quote!(Some(#ident.clone())),
+                                // variant 7
+                                (_, _, true, None) => quote!(#ident),
+                                // variant 8
+                                (_, _, false, None) => quote!(Some(#ident)),
+                            };
+
+                            Some(quote!(#name::#v {#borrow #ident, ..} => {#body},))
+                        }
+                    })
+                    // if there were fewer bindings than variants,
+                    // the return type will be optional, so we can
+                    // automatically insert the fallthrough.
+                    .chain(iter::once(quote!(_ => { None },)))
+                    .take(num_variants);
 
                 field_accessors.push(quote! {
                     #(#docs)*
                     #[inline]
-                    pub fn #ident(&self) -> #ty {
-                        match *self { #body }
+                    #vis fn #ident(&self) -> #ty {
+                        match *self { #(#body)* }
                     }
                 });
             }
@@ -239,62 +330,50 @@ fn impl_auto_accessor(mut s: Structure) -> TokenStream {
         field_accessors.into_iter()
     });
 
-    let is_variant = s.variants().iter().map(|variant_info| {
-        // clone structure for use on this variant
-        let mut s = s.clone();
-
-        // Don't bother binding any fields
-        s.filter(|_| false);
-
-        let ident_str = variant_info.ast().ident.to_string();
-
+    let is_variants = data.variants.iter().map(|variant| {
         let method = Ident::new(
-            &format!("is_{}", ident_str.to_lowercase()),
+            &format!("is_{}", variant.ident.to_string().to_lowercase()),
             Span::call_site(),
         );
-
-        let body = s.each_variant(|v| {
-            if v.ast().ident == variant_info.ast().ident {
-                quote!(true)
-            } else {
-                quote!(false)
-            }
-        });
-
         let doc = Lit::new(Literal::string(&format!(
             "Returns true if the enum is variant [`{0}`](#variant.{0})",
-            ident_str
+            variant.ident
         )));
+
+        let body = data
+            .variants
+            .iter()
+            .filter_map(|other_variant| {
+                if other_variant == variant {
+                    let v = &other_variant.ident;
+
+                    Some(quote!(#name::#v {..} => { true }))
+                } else {
+                    None
+                }
+            })
+            .chain(iter::once(quote!(_ => { false })))
+            .take(num_variants);
 
         quote! {
             #[doc = #doc]
             #[inline]
-            pub fn #method(&self) -> bool {
-                match *self { #body }
+            #vis fn #method(&self) -> bool {
+                match *self { #(#body)* }
             }
         }
     });
 
+    let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
+
     quote! {
-        #[allow(non_shorthand_field_patterns, unused_variables)]
         impl #impl_generics #name #ty_generics #where_clause {
-            #(#is_variant)*
+            #(#is_variants)*
 
             #(#accessors)*
         }
     }
 }
-
-//fn reparse_lit_as_type(lit: Lit) -> Option<Type> {
-//    match lit {
-//        Lit::Str(ref s) => {
-//            let s = s.value();
-//
-//            syn::parse_str(s.trim_matches('"')).ok()
-//        }
-//        _ => None,
-//    }
-//}
 
 fn flatten(ty: &Type) -> Option<Type> {
     match ty {

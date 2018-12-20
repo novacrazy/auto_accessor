@@ -37,7 +37,6 @@ pub enum Test<T: Clone> {
         k: &'static str,
         l: char,
         n: Option<Vec<i32>>,
-        w: Vec<bool>,
         o: Vec<char>,
         e: Vec<&'static str>,
         _ignored: bool,
