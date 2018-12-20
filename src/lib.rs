@@ -331,35 +331,26 @@ fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream 
     });
 
     let is_variants = data.variants.iter().map(|variant| {
+        let v = &variant.ident;
+
         let method = Ident::new(
-            &format!("is_{}", variant.ident.to_string().to_lowercase()),
+            &format!("is_{}", v.to_string().to_lowercase()),
             Span::call_site(),
         );
+
         let doc = Lit::new(Literal::string(&format!(
             "Returns true if the enum is variant [`{0}`](#variant.{0})",
-            variant.ident
+            v
         )));
-
-        let body = data
-            .variants
-            .iter()
-            .filter_map(|other_variant| {
-                if other_variant == variant {
-                    let v = &other_variant.ident;
-
-                    Some(quote!(#name::#v {..} => { true }))
-                } else {
-                    None
-                }
-            })
-            .chain(iter::once(quote!(_ => { false })))
-            .take(num_variants);
 
         quote! {
             #[doc = #doc]
             #[inline]
             #vis fn #method(&self) -> bool {
-                match *self { #(#body)* }
+                match *self {
+                    #name::#v { .. } => { true },
+                    _ => { false },
+                }
             }
         }
     });

@@ -45,4 +45,9 @@ pub enum Test<T: Clone> {
     },
 }
 
+#[derive(AutoAccessor)]
+pub enum Test2 {
+    A { a: i32 },
+}
+
 fn main() {}
