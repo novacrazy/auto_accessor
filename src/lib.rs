@@ -9,16 +9,13 @@ use std::iter;
 use proc_macro2::{Literal, Span, TokenStream};
 use syn::DeriveInput;
 use syn::{
-    AngleBracketedGenericArguments, AttrStyle, Attribute, Data, DataEnum, DataStruct, Fields,
-    GenericArgument, Ident, Lit, Meta, NestedMeta, Path, PathArguments, Type, TypePath, Visibility,
+    AngleBracketedGenericArguments, AttrStyle, Attribute, Data, DataEnum, DataStruct, Fields, GenericArgument, Ident,
+    Lit, Meta, NestedMeta, Path, PathArguments, Type, TypePath, Visibility,
 };
 
 #[proc_macro_derive(AutoAccessor, attributes(access))]
 pub fn my_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
-    impl_auto_accessor(
-        syn::parse(input).expect("Failed to parse input to `#[derive(AutoAccessor)]`"),
-    )
-    .into()
+    impl_auto_accessor(syn::parse(input).expect("Failed to parse input to `#[derive(AutoAccessor)]`")).into()
 }
 
 fn impl_auto_accessor(input: DeriveInput) -> TokenStream {
@@ -27,6 +24,66 @@ fn impl_auto_accessor(input: DeriveInput) -> TokenStream {
         Data::Enum(ref e) => impl_enum_auto_accessor(&input, e),
         _ => panic!("AutoAccessor isn't available for non-Enum/Struct types"),
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Visit {
+    Continue,
+    Halt,
+}
+
+impl From<()> for Visit {
+    fn from(_: ()) -> Visit {
+        Visit::Continue
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Visited {
+    Completed,
+    Halted,
+}
+
+fn visit_attrs<V: Into<Visit>>(attrs: &[Attribute], mut f: impl FnMut(&Meta, &Attribute) -> V) -> Visited {
+    for attr in attrs {
+        if attr.style == AttrStyle::Outer {
+            if let Ok(ref meta) = attr.parse_meta() {
+                if let Visit::Halt = f(meta, attr).into() {
+                    return Visited::Halted;
+                }
+            }
+        }
+    }
+
+    Visited::Completed
+}
+
+fn visit_nested_attrs<V: Into<Visit>>(attrs: &[Attribute], mut f: impl FnMut(&NestedMeta, &Attribute) -> V) -> Visited {
+    visit_attrs(attrs, |meta, attr| match meta {
+        Meta::List(ref meta_list) if meta_list.ident == "access" => {
+            for meta in &meta_list.nested {
+                if f(meta, attr).into() == Visit::Halt {
+                    return Visit::Halt;
+                }
+            }
+
+            Visit::Continue
+        }
+        _ => Visit::Continue,
+    })
+}
+
+fn iter_docs(attrs: &[Attribute]) -> impl Iterator<Item = &Attribute> {
+    attrs.iter().filter(|attr| {
+        if attr.style != AttrStyle::Outer {
+            return false;
+        }
+
+        match attr.parse_meta().ok() {
+            Some(Meta::NameValue(ref meta)) if meta.ident == "doc" => true,
+            _ => false,
+        }
+    })
 }
 
 fn impl_struct_auto_accessor(input: &DeriveInput, data: &DataStruct) -> TokenStream {
@@ -46,13 +103,26 @@ fn impl_struct_auto_accessor(input: &DeriveInput, data: &DataStruct) -> TokenStr
         panic!("AutoAccessor only works on structures with named fields");
     }
 
-    let inherited_vis: Option<Visibility> =
-        parse_visibility(struct_attrs, struct_vis.clone(), None);
+    let inherited_vis: Option<Visibility> = parse_visibility(struct_attrs, struct_vis.clone(), None);
+
+    let mut struct_prefix = None;
+
+    visit_nested_attrs(struct_attrs, |meta, _| match meta {
+        NestedMeta::Meta(Meta::NameValue(ref meta)) if meta.ident == "prefix" => {
+            if let Lit::Str(ref s) = meta.lit {
+                struct_prefix = Some(s.value());
+            }
+        }
+        _ => (),
+    });
 
     let accessors = data.fields.iter().filter_map(|field| {
-        let ident = field.ident.as_ref().unwrap();
+        let field_ident = field.ident.as_ref();
 
-        if ident.to_string().starts_with('_') {
+        let mut accessor_name = field_ident.cloned().unwrap().to_string();
+        let mut prefix = None;
+
+        if accessor_name.starts_with('_') {
             return None;
         }
 
@@ -67,46 +137,47 @@ fn impl_struct_auto_accessor(input: &DeriveInput, data: &DataStruct) -> TokenStr
             inherited_vis.clone().or_else(|| Some(field.vis.clone())),
         );
 
-        let mut docs = Vec::new();
+        // collect docs
+        let docs = iter_docs(&field.attrs);
 
-        for attr in &field.attrs {
-            if attr.style != AttrStyle::Outer {
-                continue;
-            }
+        let res = visit_nested_attrs(&field.attrs, |meta, _| match meta {
+            NestedMeta::Meta(Meta::Word(ref ident)) => {
+                if ident == "clone" {
+                    clonable = true;
+                } else if ident == "copy" {
+                    copyable = true;
+                } else if ident == "ignore" {
+                    return Visit::Halt;
+                }
 
-            match attr.parse_meta().ok() {
-                Some(Meta::List(ref meta_list)) if meta_list.ident == "access" => {
-                    for meta in &meta_list.nested {
-                        match *meta {
-                            NestedMeta::Meta(Meta::Word(ref ident)) => {
-                                if ident == "clone" {
-                                    clonable = true;
-                                } else if ident == "copy" {
-                                    copyable = true;
-                                } else if ident == "ignore" {
-                                    return None;
-                                }
-                            }
-                            _ => continue,
-                        }
-                    }
-                }
-                Some(Meta::NameValue(ref meta)) if meta.ident == "doc" => {
-                    if !docs.contains(&attr) {
-                        docs.push(attr);
-                    }
-                }
-                _ => {}
+                Visit::Continue
             }
+            NestedMeta::Meta(Meta::NameValue(ref meta)) if meta.ident == "prefix" => {
+                if let Lit::Str(ref s) = meta.lit {
+                    prefix = Some(s.value());
+                }
+
+                Visit::Continue
+            }
+            NestedMeta::Meta(Meta::NameValue(ref meta)) if meta.ident == "rename" => {
+                if let Lit::Str(ref s) = meta.lit {
+                    accessor_name = s.value();
+                }
+
+                Visit::Continue
+            }
+            _ => Visit::Continue,
+        });
+
+        // Halted only if the field was set to ignore, to skip it
+        if res == Visited::Halted {
+            return None;
         }
 
         let flattened_type = flatten(ty);
 
         copyable = copyable
-            || flattened_type
-                .as_ref()
-                .map(is_trivially_copyable)
-                .unwrap_or(false)
+            || flattened_type.as_ref().map(is_trivially_copyable).unwrap_or(false)
             || is_trivially_copyable(ty);
 
         let ty = match (copyable || clonable, &flattened_type) {
@@ -117,11 +188,19 @@ fn impl_struct_auto_accessor(input: &DeriveInput, data: &DataStruct) -> TokenStr
         };
 
         let body = match (copyable, clonable, &flattened_type) {
-            (true, _, _) => quote!(self.#ident),
-            (_, true, _) => quote!(self.#ident.clone()),
-            (false, false, Some(_)) => quote!(self.#ident.as_ref()),
-            (false, false, None) => quote!(&self.#ident),
+            (true, _, _) => quote!(self.#field_ident),
+            (_, true, _) => quote!(self.#field_ident.clone()),
+            (false, false, Some(_)) => quote!(self.#field_ident.as_ref()),
+            (false, false, None) => quote!(&self.#field_ident),
         };
+
+        let full_name = match (&struct_prefix, prefix) {
+            (Some(ref s), Some(ref p)) => format!("{}{}{}", s, p, accessor_name),
+            (Some(ref p), None) | (None, Some(ref p)) => format!("{}{}", p, accessor_name),
+            _ => accessor_name,
+        };
+
+        let ident = Ident::new(&full_name, Span::call_site());
 
         Some(quote! {
             #(#docs)*
@@ -149,8 +228,25 @@ fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream 
 
     let num_variants = data.variants.len();
 
-    let inherited_vis: Option<Visibility> =
-        parse_visibility(enum_attrs, enum_vis.clone(), Some(enum_vis.clone()));
+    let inherited_vis: Option<Visibility> = parse_visibility(enum_attrs, enum_vis.clone(), Some(enum_vis.clone()));
+
+    let mut enum_prefix = None;
+    let mut fields_only_prefix = false;
+
+    visit_nested_attrs(enum_attrs, |meta, _| match meta {
+        NestedMeta::Meta(Meta::NameValue(ref meta)) if meta.ident == "prefix" => {
+            if let Lit::Str(ref s) = meta.lit {
+                enum_prefix = Some(s.value());
+            }
+        }
+        NestedMeta::Meta(Meta::NameValue(ref meta)) if meta.ident == "prefix_fields" => {
+            if let Lit::Str(ref s) = meta.lit {
+                enum_prefix = Some(s.value());
+                fields_only_prefix = true;
+            }
+        }
+        _ => (),
+    });
 
     let mut done: Vec<String> = Vec::new();
 
@@ -169,21 +265,25 @@ fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream 
         'skip_field: for field in variant.fields.iter() {
             let ident: Ident = field.ident.clone().unwrap();
 
-            let ident_str = ident.to_string();
+            let field_ident = ident.to_string();
 
-            if ident_str.starts_with('_') {
+            if field_ident.starts_with('_') {
                 continue 'skip_field;
             }
 
-            if !done.contains(&ident_str) {
+            if !done.contains(&field_ident) {
                 let ty = &field.ty;
+
+                let mut rename = None;
 
                 let mut clonable = false;
                 let mut copyable = false;
 
+                let mut prefix = None;
+
                 let mut presence = 0;
 
-                let mut docs = Vec::new();
+                let mut docs: Vec<&Attribute> = Vec::new();
 
                 let mut vis: Option<Visibility> = inherited_vis.clone();
 
@@ -196,58 +296,61 @@ fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream 
 
                             presence += 1;
 
-                            vis =
-                                parse_visibility(&other_field.attrs, enum_vis.clone(), vis.clone());
+                            vis = parse_visibility(&other_field.attrs, enum_vis.clone(), vis.clone());
 
-                            for attr in &other_field.attrs {
-                                if attr.style != AttrStyle::Outer {
-                                    continue;
+                            let new_docs = iter_docs(&other_field.attrs);
+
+                            let res = visit_nested_attrs(&other_field.attrs, |meta, _| match *meta {
+                                NestedMeta::Meta(Meta::Word(ref ident)) => {
+                                    if ident == "clone" {
+                                        clonable = true;
+                                    } else if ident == "copy" {
+                                        copyable = true;
+                                    } else if ident == "ignore" {
+                                        return Visit::Halt;
+                                    }
+
+                                    Visit::Continue
                                 }
-
-                                match attr.parse_meta().ok() {
-                                    Some(Meta::List(ref meta_list))
-                                        if meta_list.ident == "access" =>
-                                    {
-                                        for meta in &meta_list.nested {
-                                            match *meta {
-                                                NestedMeta::Meta(Meta::Word(ref ident)) => {
-                                                    if ident == "clone" {
-                                                        clonable = true;
-                                                    } else if ident == "copy" {
-                                                        copyable = true;
-                                                    } else if ident == "ignore" {
-                                                        done.push(ident_str);
-
-                                                        continue 'skip_field;
-                                                    }
-                                                }
-                                                _ => continue,
-                                            }
-                                        }
+                                NestedMeta::Meta(Meta::NameValue(ref meta)) if meta.ident == "prefix" => {
+                                    if let Lit::Str(ref s) = meta.lit {
+                                        prefix = Some(s.value());
                                     }
-                                    Some(Meta::NameValue(ref meta)) if meta.ident == "doc" => {
-                                        if !docs.contains(&attr) {
-                                            docs.push(attr);
-                                        }
+
+                                    Visit::Continue
+                                }
+                                NestedMeta::Meta(Meta::NameValue(ref meta)) if meta.ident == "rename" => {
+                                    if let Lit::Str(ref s) = meta.lit {
+                                        rename = Some(s.value());
                                     }
-                                    _ => {}
+
+                                    Visit::Continue
+                                }
+                                _ => Visit::Continue,
+                            });
+
+                            // Halted only if the field was set to ignore, to skip it
+                            if res == Visited::Halted {
+                                done.push(field_ident);
+
+                                continue 'skip_field;
+                            }
+
+                            for new_doc in new_docs {
+                                if !docs.contains(&new_doc) {
+                                    docs.push(new_doc);
                                 }
                             }
                         }
                     }
                 }
 
-                done.push(ident_str);
-
                 docs.dedup();
 
                 let flattened_type = flatten(ty);
 
                 copyable = copyable
-                    || flattened_type
-                        .as_ref()
-                        .map(is_trivially_copyable)
-                        .unwrap_or(false)
+                    || flattened_type.as_ref().map(is_trivially_copyable).unwrap_or(false)
                     || is_trivially_copyable(ty);
 
                 let is_in_all = presence == num_variants;
@@ -293,10 +396,7 @@ fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream 
                     .filter_map(|variant| {
                         let v = &variant.ident;
 
-                        let has_binding = variant
-                            .fields
-                            .iter()
-                            .any(|field| field.ident.as_ref() == Some(&ident));
+                        let has_binding = variant.fields.iter().any(|field| field.ident.as_ref() == Some(&ident));
 
                         if !has_binding {
                             None
@@ -333,49 +433,89 @@ fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream 
                     .chain(iter::once(quote!(_ => { None },)))
                     .take(num_variants);
 
+                let field_name = rename.unwrap_or_else(|| field_ident.clone());
+
+                let method = match (&enum_prefix, prefix) {
+                    (Some(ref e), Some(ref p)) => format!("{}{}{}", e, p, field_name),
+                    (Some(ref p), _) | (_, Some(ref p)) => format!("{}{}", p, field_name),
+                    _ => field_name,
+                };
+
+                let method_ident = Ident::new(&method, Span::call_site());
+
                 field_accessors.push(quote! {
                     #(#docs)*
                     #[inline]
-                    #vis fn #ident(&self) -> #ty {
+                    #vis fn #method_ident(&self) -> #ty {
                         match *self { #(#body)* }
                     }
                 });
+
+                done.push(field_ident);
             }
         }
 
         field_accessors.into_iter()
     });
 
-    let is_variants = data.variants.iter().map(|variant| {
+    let is_variants = data.variants.iter().filter_map(|variant| {
         let v = &variant.ident;
 
-        let method = Ident::new(
-            &format!("is_{}", v.to_string().to_lowercase()),
-            Span::call_site(),
-        );
+        let mut variant_name = v.to_string().to_lowercase();
+
+        let mut prefix = None;
+
+        let res = visit_nested_attrs(&variant.attrs, |meta, _| match meta {
+            NestedMeta::Meta(Meta::Word(ref ident)) => {
+                if ident == "ignore" {
+                    return Visit::Halt;
+                }
+
+                Visit::Continue
+            }
+            NestedMeta::Meta(Meta::NameValue(ref meta)) if meta.ident == "prefix" => {
+                if let Lit::Str(ref s) = meta.lit {
+                    prefix = Some(s.value());
+                }
+
+                Visit::Continue
+            }
+            NestedMeta::Meta(Meta::NameValue(ref meta)) if meta.ident == "rename" => {
+                if let Lit::Str(ref s) = meta.lit {
+                    variant_name = s.value();
+                }
+
+                Visit::Continue
+            }
+            _ => Visit::Continue,
+        });
+
+        if res == Visited::Halted {
+            return None;
+        }
 
         let doc = Lit::new(Literal::string(&format!(
             "Returns true if the enum is variant [`{0}`](#variant.{0})",
             v
         )));
 
-        let mut variant_docs = variant.attrs.iter().filter(|attr| {
-            if attr.style != AttrStyle::Outer {
-                return false;
-            }
-
-            match attr.parse_meta().ok() {
-                Some(Meta::NameValue(ref meta)) if meta.ident == "doc" => true,
-                _ => false,
-            }
-        });
+        let mut variant_docs = iter_docs(&variant.attrs);
 
         let first_variant_doc = variant_docs.next();
 
         // if there is a variant doc comment, insert an extra newline
         let extra_doc_space = first_variant_doc.as_ref().map(|_| quote!(#[doc = ""]));
 
-        quote! {
+        let method = match (&enum_prefix, prefix) {
+            (Some(ref e), Some(ref p)) if !fields_only_prefix => format!("{}{}{}", e, p, variant_name),
+            (Some(ref p), None) if !fields_only_prefix => format!("{}is_{}", p, variant_name),
+            (None, Some(ref p)) => format!("{}{}", p, variant_name),
+            _ => format!("is_{}", variant_name),
+        };
+
+        let method = Ident::new(&method, Span::call_site());
+
+        Some(quote! {
             #[doc = #doc]
             #extra_doc_space
             #first_variant_doc
@@ -387,7 +527,7 @@ fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream 
                     _ => { false },
                 }
             }
-        }
+        })
     });
 
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
@@ -408,44 +548,31 @@ fn parse_visibility(
 ) -> Option<Visibility> {
     let mut vis = initial_vis;
 
-    for attr in attrs {
-        if attr.style != AttrStyle::Outer {
-            continue;
-        }
-
-        match attr.parse_meta().ok() {
-            Some(Meta::List(ref meta_list)) if meta_list.ident == "access" => {
-                for meta in &meta_list.nested {
-                    match *meta {
-                        NestedMeta::Meta(Meta::Word(ref ident)) => {
-                            if ident == "hidden" || ident == "private" {
-                                vis = None;
-                            } else if ident == "public" {
-                                vis = Some(Visibility::Public(syn::VisPublic {
-                                    pub_token: syn::token::Pub {
-                                        span: Span::call_site(),
-                                    },
-                                }));
-                            }
-                        }
-                        NestedMeta::Meta(Meta::NameValue(ref meta)) if meta.ident == "vis" => {
-                            if let Lit::Str(ref s) = meta.lit {
-                                let value = s.value();
-
-                                vis = match value.as_str() {
-                                    "inherit" => Some(parent_vis.clone()),
-                                    "private" => None,
-                                    _ => Some(syn::parse_str(&value).unwrap()),
-                                };
-                            }
-                        }
-                        _ => continue,
-                    }
-                }
+    visit_nested_attrs(attrs, |meta, _| match meta {
+        NestedMeta::Meta(Meta::Word(ref ident)) => {
+            if ident == "hidden" || ident == "private" {
+                vis = None;
+            } else if ident == "public" {
+                vis = Some(Visibility::Public(syn::VisPublic {
+                    pub_token: syn::token::Pub {
+                        span: Span::call_site(),
+                    },
+                }));
             }
-            _ => {}
         }
-    }
+        NestedMeta::Meta(Meta::NameValue(ref meta)) if meta.ident == "vis" => {
+            if let Lit::Str(ref s) = meta.lit {
+                let value = s.value();
+
+                vis = match value.as_str() {
+                    "inherit" => Some(parent_vis.clone()),
+                    "private" | "hidden" => None,
+                    _ => Some(syn::parse_str(&value).unwrap()),
+                };
+            }
+        }
+        _ => (),
+    });
 
     vis
 }
@@ -470,13 +597,12 @@ fn flatten(ty: &Type) -> Option<Type> {
 
             if outer_type.value().ident == "Option" {
                 match outer_type.value().arguments {
-                    PathArguments::AngleBracketed(AngleBracketedGenericArguments {
-                        ref args,
-                        ..
-                    }) => match args.first().unwrap().value() {
-                        GenericArgument::Type(ref ty) => Some(ty.clone()),
-                        _ => None,
-                    },
+                    PathArguments::AngleBracketed(AngleBracketedGenericArguments { ref args, .. }) => {
+                        match args.first().unwrap().value() {
+                            GenericArgument::Type(ref ty) => Some(ty.clone()),
+                            _ => None,
+                        }
+                    }
                     _ => None,
                 }
             } else {
@@ -489,8 +615,7 @@ fn flatten(ty: &Type) -> Option<Type> {
 
 fn is_trivially_copyable(ty: &Type) -> bool {
     const PRIMITIVE_TYPES: &[&str] = &[
-        "i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "isize", "usize", "bool", "char",
-        "f32", "f64",
+        "i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "isize", "usize", "bool", "char", "f32", "f64",
     ];
 
     match ty {

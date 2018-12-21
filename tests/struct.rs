@@ -2,7 +2,7 @@
 extern crate auto_accessor;
 
 #[derive(AutoAccessor)]
-#[access(inherit)]
+#[access(inherit, prefix = "hello_")]
 pub struct Test<T: Clone> {
     /// Hello, there
     pub a: i32,
@@ -12,10 +12,10 @@ pub struct Test<T: Clone> {
     #[access(clone, vis = "pub(self)")]
     pub j: Option<Vec<i32>>,
 
-    #[access(clone)]
+    #[access(clone, rename = "wumbo")]
     pub w: Vec<bool>,
 
-    #[access(vis = "pub(crate)")]
+    #[access(vis = "pub(crate)", prefix = "test_")]
     o: Vec<T>,
 
     #[access(ignore)]
