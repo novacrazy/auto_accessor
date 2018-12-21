@@ -2,6 +2,7 @@
 extern crate auto_accessor;
 
 #[derive(AutoAccessor)]
+#[access(private)]
 pub enum Test<T: Clone> {
     A {
         /// Hello, there
@@ -9,7 +10,7 @@ pub enum Test<T: Clone> {
         l: char,
         n: Option<Vec<i32>>,
         #[access(clone)]
-        j: Option<Vec<i32>>,
+        j: ::std::option::Option<Vec<i32>>,
         #[access(clone)]
         w: Vec<bool>,
         o: Vec<char>,
@@ -38,6 +39,7 @@ pub enum Test<T: Clone> {
         l: char,
         n: Option<Vec<i32>>,
         o: Vec<char>,
+        #[access(public)]
         e: Vec<&'static str>,
         _ignored: bool,
         #[access(ignore)]
@@ -46,8 +48,11 @@ pub enum Test<T: Clone> {
 }
 
 #[derive(AutoAccessor)]
-pub enum Test2 {
-    A { a: i32 },
+enum Test2 {
+    A {
+        #[access(vis = "pub(crate)")]
+        a: i32,
+    },
 }
 
 fn main() {}

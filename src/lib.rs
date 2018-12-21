@@ -9,8 +9,8 @@ use std::iter;
 use proc_macro2::{Literal, Span, TokenStream};
 use syn::DeriveInput;
 use syn::{
-    AngleBracketedGenericArguments, AttrStyle, Data, DataEnum, DataStruct, Fields, GenericArgument,
-    Ident, Lit, Meta, NestedMeta, PathArguments, Type, TypePath,
+    AngleBracketedGenericArguments, AttrStyle, Attribute, Data, DataEnum, DataStruct, Fields,
+    GenericArgument, Ident, Lit, Meta, NestedMeta, Path, PathArguments, Type, TypePath, Visibility,
 };
 
 #[proc_macro_derive(AutoAccessor, attributes(access))]
@@ -31,7 +31,10 @@ fn impl_auto_accessor(input: DeriveInput) -> TokenStream {
 
 fn impl_struct_auto_accessor(input: &DeriveInput, data: &DataStruct) -> TokenStream {
     let DeriveInput {
-        ident: ref name, ..
+        ident: ref name,
+        vis: ref struct_vis,
+        attrs: ref struct_attrs,
+        ..
     } = input;
 
     let is_struct = match data.fields {
@@ -40,12 +43,14 @@ fn impl_struct_auto_accessor(input: &DeriveInput, data: &DataStruct) -> TokenStr
     };
 
     if !is_struct {
-        panic!("AutoAccessor only works on named structures");
+        panic!("AutoAccessor only works on structures with named fields");
     }
+
+    let inherited_vis: Option<Visibility> =
+        parse_visibility(struct_attrs, struct_vis.clone(), None);
 
     let accessors = data.fields.iter().filter_map(|field| {
         let ident = field.ident.as_ref().unwrap();
-        let vis = &field.vis;
 
         if ident.to_string().starts_with('_') {
             return None;
@@ -55,6 +60,12 @@ fn impl_struct_auto_accessor(input: &DeriveInput, data: &DataStruct) -> TokenStr
 
         let mut clonable = false;
         let mut copyable = false;
+
+        let vis: Option<Visibility> = parse_visibility(
+            &field.attrs,
+            struct_vis.clone(),
+            inherited_vis.clone().or_else(|| Some(field.vis.clone())),
+        );
 
         let mut docs = Vec::new();
 
@@ -99,8 +110,8 @@ fn impl_struct_auto_accessor(input: &DeriveInput, data: &DataStruct) -> TokenStr
             || is_trivially_copyable(ty);
 
         let ty = match (copyable || clonable, &flattened_type) {
-            (true, Some(ty)) => quote!(Option<#ty>),
-            (false, Some(ty)) => quote!(Option<&#ty>),
+            (true, Some(ty)) => quote!(::std::option::Option<#ty>),
+            (false, Some(ty)) => quote!(::std::option::Option<&#ty>),
             (true, None) => quote!(#ty),
             (false, None) => quote!(&#ty),
         };
@@ -131,11 +142,15 @@ fn impl_struct_auto_accessor(input: &DeriveInput, data: &DataStruct) -> TokenStr
 fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream {
     let DeriveInput {
         ident: ref name,
-        ref vis,
+        vis: ref enum_vis,
+        attrs: ref enum_attrs,
         ..
     } = input;
 
     let num_variants = data.variants.len();
+
+    let inherited_vis: Option<Visibility> =
+        parse_visibility(enum_attrs, enum_vis.clone(), Some(enum_vis.clone()));
 
     let mut done: Vec<String> = Vec::new();
 
@@ -146,7 +161,7 @@ fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream 
         };
 
         if !is_struct {
-            panic!("Only works on struct enums");
+            panic!("AutoAccessor only works on struct enum variants with named fields");
         }
 
         let mut field_accessors = Vec::new();
@@ -172,6 +187,8 @@ fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream 
 
                 let mut docs = Vec::new();
 
+                let mut vis: Option<Visibility> = inherited_vis.clone();
+
                 for other_variant in data.variants.iter() {
                     for other_field in other_variant.fields.iter() {
                         if other_field.ident == field.ident {
@@ -180,6 +197,9 @@ fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream 
                             }
 
                             presence += 1;
+
+                            vis =
+                                parse_visibility(&other_field.attrs, enum_vis.clone(), vis.clone());
 
                             for attr in &other_field.attrs {
                                 if attr.style != AttrStyle::Outer {
@@ -210,8 +230,6 @@ fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream 
                                     Some(Meta::NameValue(ref meta)) if meta.ident == "doc" => {
                                         if !docs.contains(&attr) {
                                             docs.push(attr);
-                                        } else {
-                                            println!("{:?}", attr);
                                         }
                                     }
                                     _ => {}
@@ -263,12 +281,12 @@ fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream 
                  */
 
                 let ty = match (copyable || clonable, is_in_all, &flattened_type) {
-                    (true, _, Some(ty)) => quote!(Option<#ty>),
-                    (false, _, Some(ty)) => quote!(Option<&#ty>),
+                    (true, _, Some(ty)) => quote!(::std::option::Option<#ty>),
+                    (false, _, Some(ty)) => quote!(::std::option::Option<&#ty>),
                     (true, true, None) => quote!(#ty),
                     (false, true, None) => quote!(&#ty),
-                    (true, false, None) => quote!(Option<#ty>),
-                    (false, false, None) => quote!(Option<&#ty>),
+                    (true, false, None) => quote!(::std::option::Option<#ty>),
+                    (false, false, None) => quote!(::std::option::Option<&#ty>),
                 };
 
                 let body = data
@@ -346,7 +364,7 @@ fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream 
         quote! {
             #[doc = #doc]
             #[inline]
-            #vis fn #method(&self) -> bool {
+            #enum_vis fn #method(&self) -> bool {
                 match *self {
                     #name::#v { .. } => { true },
                     _ => { false },
@@ -366,10 +384,72 @@ fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream 
     }
 }
 
+fn parse_visibility(
+    attrs: &[Attribute],
+    parent_vis: Visibility,
+    initial_vis: Option<Visibility>,
+) -> Option<Visibility> {
+    let mut vis = initial_vis;
+
+    for attr in attrs {
+        if attr.style != AttrStyle::Outer {
+            continue;
+        }
+
+        match attr.parse_meta().ok() {
+            Some(Meta::List(ref meta_list)) if meta_list.ident == "access" => {
+                for meta in &meta_list.nested {
+                    match *meta {
+                        NestedMeta::Meta(Meta::Word(ref ident)) => {
+                            if ident == "hidden" || ident == "private" {
+                                vis = None;
+                            } else if ident == "public" {
+                                vis = Some(Visibility::Public(syn::VisPublic {
+                                    pub_token: syn::token::Pub {
+                                        span: Span::call_site(),
+                                    },
+                                }));
+                            }
+                        }
+                        NestedMeta::Meta(Meta::NameValue(ref meta)) if meta.ident == "vis" => {
+                            if let Lit::Str(ref s) = meta.lit {
+                                let value = s.value();
+
+                                vis = match value.as_str() {
+                                    "inherit" => Some(parent_vis.clone()),
+                                    "private" => None,
+                                    _ => Some(syn::parse_str(&value).unwrap()),
+                                };
+                            }
+                        }
+                        _ => continue,
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    vis
+}
+
 fn flatten(ty: &Type) -> Option<Type> {
     match ty {
         Type::Path(TypePath { ref path, .. }) => {
-            let outer_type = path.segments.first().unwrap();
+            let fully_qualified = syn::parse_str::<Path>("::std::option::Option").unwrap();
+
+            let num_same_idents = fully_qualified
+                .segments
+                .iter()
+                .zip(path.segments.iter())
+                .filter(|(f, t)| f.ident == t.ident)
+                .count();
+
+            let outer_type = if num_same_idents == path.segments.len() {
+                path.segments.last().unwrap()
+            } else {
+                path.segments.first().unwrap()
+            };
 
             if outer_type.value().ident == "Option" {
                 match outer_type.value().arguments {
