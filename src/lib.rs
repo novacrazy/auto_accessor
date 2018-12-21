@@ -175,9 +175,7 @@ fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream 
                 continue 'skip_field;
             }
 
-            if done.contains(&ident_str) {
-                continue;
-            } else {
+            if !done.contains(&ident_str) {
                 let ty = &field.ty;
 
                 let mut clonable = false;

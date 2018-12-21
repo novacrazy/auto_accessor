@@ -25,6 +25,7 @@ pub enum Test<T: Clone> {
         /// Hmmm...
         l: char,
         n: Option<Vec<i32>>,
+        #[access(public)]
         w: Vec<bool>,
         o: Vec<char>,
         ignored: bool,
