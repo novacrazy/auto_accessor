@@ -15,9 +15,9 @@ use syn::{
 
 #[proc_macro_derive(AutoAccessor, attributes(access))]
 pub fn my_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
-    impl_auto_accessor(syn::parse(input).expect(concat!(
-        "Failed to parse input to `#[derive(AutoAccessor)]`"
-    )))
+    impl_auto_accessor(
+        syn::parse(input).expect("Failed to parse input to `#[derive(AutoAccessor)]`"),
+    )
     .into()
 }
 
