@@ -465,6 +465,8 @@ fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream 
 
         let mut prefix = None;
 
+        let vis = parse_visibility(&variant.attrs, enum_vis.clone(), inherited_vis.clone());
+
         let res = visit_nested_attrs(&variant.attrs, |meta, _| match meta {
             NestedMeta::Meta(Meta::Word(ref ident)) => {
                 if ident == "ignore" {
@@ -521,7 +523,7 @@ fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream 
             #first_variant_doc
             #(#variant_docs)*
             #[inline]
-            #enum_vis fn #method(&self) -> bool {
+            #vis fn #method(&self) -> bool {
                 match *self {
                     #name::#v { .. } => { true },
                     _ => { false },

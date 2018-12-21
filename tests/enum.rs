@@ -32,6 +32,7 @@ pub enum Test<T: Clone> {
         o: Vec<char>,
         ignored: bool,
     },
+    #[access(vis = "pub(crate)")]
     C {
         /// One
         /// Two
