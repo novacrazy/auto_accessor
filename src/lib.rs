@@ -361,8 +361,27 @@ fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream 
             v
         )));
 
+        let mut variant_docs = variant.attrs.iter().filter(|attr| {
+            if attr.style != AttrStyle::Outer {
+                return false;
+            }
+
+            match attr.parse_meta().ok() {
+                Some(Meta::NameValue(ref meta)) if meta.ident == "doc" => true,
+                _ => false,
+            }
+        });
+
+        let first_variant_doc = variant_docs.next();
+
+        // if there is a variant doc comment, insert an extra newline
+        let extra_doc_space = first_variant_doc.as_ref().map(|_| quote!(#[doc = ""]));
+
         quote! {
             #[doc = #doc]
+            #extra_doc_space
+            #first_variant_doc
+            #(#variant_docs)*
             #[inline]
             #enum_vis fn #method(&self) -> bool {
                 match *self {

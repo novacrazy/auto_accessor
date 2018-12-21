@@ -16,6 +16,7 @@ pub enum Test<T: Clone> {
         o: Vec<char>,
         ignored: bool,
     },
+    /// This is the second variant
     B {
         /// Also here
         a: i32,
