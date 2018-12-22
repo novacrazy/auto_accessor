@@ -26,67 +26,6 @@ fn impl_auto_accessor(input: DeriveInput) -> TokenStream {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Visit {
-    Continue,
-    Halt,
-}
-
-impl From<()> for Visit {
-    fn from(_: ()) -> Visit {
-        Visit::Continue
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Visited {
-    Completed,
-    Halted,
-}
-
-fn visit_attrs<V: Into<Visit>>(attrs: &[Attribute], mut f: impl FnMut(&Meta, &Attribute) -> V) -> Visited {
-    for attr in attrs {
-        if attr.style == AttrStyle::Outer {
-            if let Ok(ref meta) = attr.parse_meta() {
-                if let Visit::Halt = f(meta, attr).into() {
-                    return Visited::Halted;
-                }
-            }
-        }
-    }
-
-    Visited::Completed
-}
-
-fn visit_nested_attrs<V: Into<Visit>>(attrs: &[Attribute], mut f: impl FnMut(&NestedMeta, &Attribute) -> V) -> Visited {
-    visit_attrs(attrs, |meta, attr| match meta {
-        Meta::List(ref meta_list) if meta_list.ident == "access" => {
-            for meta in &meta_list.nested {
-                if f(meta, attr).into() == Visit::Halt {
-                    return Visit::Halt;
-                }
-            }
-
-            Visit::Continue
-        }
-        _ => Visit::Continue,
-    })
-}
-
-/// Lazily collect all "doc" attributes
-fn iter_docs(attrs: &[Attribute]) -> impl Iterator<Item = &Attribute> {
-    attrs.iter().filter(|attr| {
-        if attr.style != AttrStyle::Outer {
-            return false;
-        }
-
-        match attr.parse_meta().ok() {
-            Some(Meta::NameValue(ref meta)) if meta.ident == "doc" => true,
-            _ => false,
-        }
-    })
-}
-
 fn impl_struct_auto_accessor(input: &DeriveInput, data: &DataStruct) -> TokenStream {
     let DeriveInput {
         ident: ref name,
@@ -121,13 +60,14 @@ fn impl_struct_auto_accessor(input: &DeriveInput, data: &DataStruct) -> TokenStr
         let field_ident = field.ident.as_ref();
 
         let mut accessor_name = field_ident.cloned().unwrap().to_string();
-        let mut prefix = None;
 
         if accessor_name.starts_with('_') {
             return None;
         }
 
         let ty = &field.ty;
+
+        let mut prefix = None;
 
         let mut clonable = false;
         let mut copyable = false;
@@ -541,6 +481,67 @@ fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream 
             #(#accessors)*
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Visit {
+    Continue,
+    Halt,
+}
+
+impl From<()> for Visit {
+    fn from(_: ()) -> Visit {
+        Visit::Continue
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Visited {
+    Completed,
+    Halted,
+}
+
+fn visit_attrs<V: Into<Visit>>(attrs: &[Attribute], mut f: impl FnMut(&Meta, &Attribute) -> V) -> Visited {
+    for attr in attrs {
+        if attr.style == AttrStyle::Outer {
+            if let Ok(ref meta) = attr.parse_meta() {
+                if let Visit::Halt = f(meta, attr).into() {
+                    return Visited::Halted;
+                }
+            }
+        }
+    }
+
+    Visited::Completed
+}
+
+fn visit_nested_attrs<V: Into<Visit>>(attrs: &[Attribute], mut f: impl FnMut(&NestedMeta, &Attribute) -> V) -> Visited {
+    visit_attrs(attrs, |meta, attr| match meta {
+        Meta::List(ref meta_list) if meta_list.ident == "access" => {
+            for meta in &meta_list.nested {
+                if f(meta, attr).into() == Visit::Halt {
+                    return Visit::Halt;
+                }
+            }
+
+            Visit::Continue
+        }
+        _ => Visit::Continue,
+    })
+}
+
+/// Lazily collect all "doc" attributes
+fn iter_docs(attrs: &[Attribute]) -> impl Iterator<Item = &Attribute> {
+    attrs.iter().filter(|attr| {
+        if attr.style != AttrStyle::Outer {
+            return false;
+        }
+
+        match attr.parse_meta().ok() {
+            Some(Meta::NameValue(ref meta)) if meta.ident == "doc" => true,
+            _ => false,
+        }
+    })
 }
 
 fn parse_visibility(
