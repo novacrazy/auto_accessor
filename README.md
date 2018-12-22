@@ -167,7 +167,7 @@ pub enum Example {
 impl Example {
     pub user(&self) -> Option<Arc<User>> {
         match *self {
-            Example::A {ref user, ..} => user.as_ref().cloned(),
+            Example::A {ref user, ..} => user.clone(),
             _ => None,
         }
     }
