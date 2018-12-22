@@ -54,11 +54,14 @@ pub enum Test<T: Clone> {
 }
 
 #[derive(AutoAccessor)]
-enum Test2 {
+#[access(vis = "")]
+pub enum Test2 {
     A {
         #[access(vis = "pub(crate)")]
         a: i32,
     },
+    #[access(ignore)]
+    B { a: i32 },
 }
 
 fn main() {}

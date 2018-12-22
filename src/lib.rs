@@ -10,7 +10,7 @@ use proc_macro2::{Literal, Span, TokenStream};
 use syn::DeriveInput;
 use syn::{
     AngleBracketedGenericArguments, AttrStyle, Attribute, Data, DataEnum, DataStruct, Fields, GenericArgument, Ident,
-    Lit, Meta, NestedMeta, Path, PathArguments, Type, TypePath, Visibility,
+    Lit, Meta, NestedMeta, Path, PathArguments, Type, TypePath, Variant, Visibility,
 };
 
 #[proc_macro_derive(AutoAccessor, attributes(access))]
@@ -73,6 +73,7 @@ fn visit_nested_attrs<V: Into<Visit>>(attrs: &[Attribute], mut f: impl FnMut(&Ne
     })
 }
 
+/// Lazily collect all "doc" attributes
 fn iter_docs(attrs: &[Attribute]) -> impl Iterator<Item = &Attribute> {
     attrs.iter().filter(|attr| {
         if attr.style != AttrStyle::Outer {
@@ -140,7 +141,7 @@ fn impl_struct_auto_accessor(input: &DeriveInput, data: &DataStruct) -> TokenStr
         // collect docs
         let docs = iter_docs(&field.attrs);
 
-        let res = visit_nested_attrs(&field.attrs, |meta, _| match meta {
+        if let Visited::Halted = visit_nested_attrs(&field.attrs, |meta, _| match meta {
             NestedMeta::Meta(Meta::Word(ref ident)) => {
                 if ident == "clone" {
                     clonable = true;
@@ -167,10 +168,8 @@ fn impl_struct_auto_accessor(input: &DeriveInput, data: &DataStruct) -> TokenStr
                 Visit::Continue
             }
             _ => Visit::Continue,
-        });
-
-        // Halted only if the field was set to ignore, to skip it
-        if res == Visited::Halted {
+        }) {
+            // Halted only if the field was set to ignore, to skip it
             return None;
         }
 
@@ -249,8 +248,10 @@ fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream 
     });
 
     let mut done: Vec<String> = Vec::new();
+    let mut ignored: Vec<&Variant> = Vec::new();
 
-    let accessors = data.variants.iter().flat_map(|variant| {
+    // quick run-through to get ignored variants and check for non-struct variants
+    for variant in data.variants.iter() {
         let is_struct = match variant.fields {
             Fields::Named(_) => true,
             _ => false,
@@ -260,6 +261,21 @@ fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream 
             panic!("AutoAccessor only works on struct enum variants with named fields");
         }
 
+        if let Visited::Halted = visit_nested_attrs(&variant.attrs, |meta, _| match meta {
+            NestedMeta::Meta(Meta::Word(ref ident)) => {
+                if ident == "ignore" {
+                    return Visit::Halt;
+                }
+
+                Visit::Continue
+            }
+            _ => Visit::Continue,
+        }) {
+            ignored.push(variant);
+        }
+    }
+
+    let accessors = data.variants.iter().flat_map(|variant| {
         let mut field_accessors = Vec::new();
 
         'skip_field: for field in variant.fields.iter() {
@@ -287,7 +303,7 @@ fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream 
 
                 let mut vis: Option<Visibility> = inherited_vis.clone();
 
-                for other_variant in data.variants.iter() {
+                for other_variant in data.variants.iter().filter(|v| !ignored.contains(&v)) {
                     for other_field in other_variant.fields.iter() {
                         if other_field.ident == field.ident {
                             if other_field.ty != *ty {
@@ -300,7 +316,7 @@ fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream 
 
                             let new_docs = iter_docs(&other_field.attrs);
 
-                            let res = visit_nested_attrs(&other_field.attrs, |meta, _| match *meta {
+                            if let Visited::Halted = visit_nested_attrs(&other_field.attrs, |meta, _| match meta {
                                 NestedMeta::Meta(Meta::Word(ref ident)) => {
                                     if ident == "clone" {
                                         clonable = true;
@@ -327,10 +343,8 @@ fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream 
                                     Visit::Continue
                                 }
                                 _ => Visit::Continue,
-                            });
-
-                            // Halted only if the field was set to ignore, to skip it
-                            if res == Visited::Halted {
+                            }) {
+                                // Halted only if the field was set to ignore, to skip it
                                 done.push(field_ident);
 
                                 continue 'skip_field;
@@ -393,6 +407,7 @@ fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream 
                 let body = data
                     .variants
                     .iter()
+                    .filter(|v| !ignored.contains(&v))
                     .filter_map(|variant| {
                         let v = &variant.ident;
 
@@ -407,7 +422,7 @@ fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream 
                                 // variant 1, 2 copy
                                 (true, _, _, Some(_)) => quote!(#ident),
                                 // variant 1, 2 clone
-                                (_, true, _, Some(_)) => quote!(#ident.as_ref().cloned()),
+                                (_, true, _, Some(_)) => quote!(#ident.clone()),
                                 // variant 3, 4
                                 (false, false, _, Some(_)) => quote!(#ident.as_ref()),
                                 // variant 5 copy
@@ -458,7 +473,7 @@ fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream 
         field_accessors.into_iter()
     });
 
-    let is_variants = data.variants.iter().filter_map(|variant| {
+    let is_variants = data.variants.iter().filter(|v| !ignored.contains(&v)).map(|variant| {
         let v = &variant.ident;
 
         let mut variant_name = v.to_string().to_lowercase();
@@ -467,34 +482,19 @@ fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream 
 
         let vis = parse_visibility(&variant.attrs, enum_vis.clone(), inherited_vis.clone());
 
-        let res = visit_nested_attrs(&variant.attrs, |meta, _| match meta {
-            NestedMeta::Meta(Meta::Word(ref ident)) => {
-                if ident == "ignore" {
-                    return Visit::Halt;
-                }
-
-                Visit::Continue
-            }
+        visit_nested_attrs(&variant.attrs, |meta, _| match meta {
             NestedMeta::Meta(Meta::NameValue(ref meta)) if meta.ident == "prefix" => {
                 if let Lit::Str(ref s) = meta.lit {
                     prefix = Some(s.value());
                 }
-
-                Visit::Continue
             }
             NestedMeta::Meta(Meta::NameValue(ref meta)) if meta.ident == "rename" => {
                 if let Lit::Str(ref s) = meta.lit {
                     variant_name = s.value();
                 }
-
-                Visit::Continue
             }
-            _ => Visit::Continue,
+            _ => (),
         });
-
-        if res == Visited::Halted {
-            return None;
-        }
 
         let doc = Lit::new(Literal::string(&format!(
             "Returns true if the enum is variant [`{0}`](#variant.{0})",
@@ -517,7 +517,7 @@ fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream 
 
         let method = Ident::new(&method, Span::call_site());
 
-        Some(quote! {
+        quote! {
             #[doc = #doc]
             #extra_doc_space
             #first_variant_doc
@@ -529,7 +529,7 @@ fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream 
                     _ => { false },
                 }
             }
-        })
+        }
     });
 
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
