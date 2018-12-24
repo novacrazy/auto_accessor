@@ -60,7 +60,7 @@ pub enum Test2 {
         #[access(vis = "pub(crate)")]
         a: i32,
     },
-    #[access(ignore)]
+    #[access(ignore_all)]
     B { a: i32 },
 }
 

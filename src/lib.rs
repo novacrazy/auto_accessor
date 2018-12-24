@@ -4,13 +4,14 @@ extern crate proc_macro2;
 extern crate quote;
 extern crate syn;
 
+use std::borrow::Cow;
 use std::iter;
 
 use proc_macro2::{Literal, Span, TokenStream};
 use syn::DeriveInput;
 use syn::{
-    AngleBracketedGenericArguments, AttrStyle, Attribute, Data, DataEnum, DataStruct, Fields, GenericArgument, Ident,
-    Lit, Meta, NestedMeta, Path, PathArguments, Type, TypePath, Variant, Visibility,
+    AngleBracketedGenericArguments, AttrStyle, Attribute, Data, DataEnum, DataStruct, Fields,
+    GenericArgument, Ident, Lit, Meta, NestedMeta, Path, PathArguments, Type, TypePath, Variant, Visibility,
 };
 
 #[proc_macro_derive(AutoAccessor, attributes(access))]
@@ -116,7 +117,7 @@ fn impl_struct_auto_accessor(input: &DeriveInput, data: &DataStruct) -> TokenStr
         let flattened_type = flatten(ty);
 
         copyable = copyable
-            || flattened_type.as_ref().map(is_trivially_copyable).unwrap_or(false)
+            || flattened_type.map(is_trivially_copyable).unwrap_or(false)
             || is_trivially_copyable(ty);
 
         let ty = match (copyable || clonable, &flattened_type) {
@@ -133,13 +134,13 @@ fn impl_struct_auto_accessor(input: &DeriveInput, data: &DataStruct) -> TokenStr
             (false, false, None) => quote!(&self.#field_ident),
         };
 
-        let full_name = match (&struct_prefix, prefix) {
+        let method = match (&struct_prefix, prefix) {
             (Some(ref s), Some(ref p)) => format!("{}{}{}", s, p, accessor_name),
             (Some(ref p), None) | (None, Some(ref p)) => format!("{}{}", p, accessor_name),
             _ => accessor_name,
         };
 
-        let ident = Ident::new(&full_name, Span::call_site());
+        let ident = Ident::new(&method, Span::call_site());
 
         Some(quote! {
             #(#docs)*
@@ -167,7 +168,8 @@ fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream 
 
     let num_variants = data.variants.len();
 
-    let inherited_vis: Option<Visibility> = parse_visibility(enum_attrs, enum_vis.clone(), Some(enum_vis.clone()));
+    let inherited_vis: Option<Visibility> =
+        parse_visibility(enum_attrs, enum_vis.clone(), Some(enum_vis.clone()));
 
     let mut enum_prefix = None;
     let mut fields_only_prefix = false;
@@ -190,7 +192,7 @@ fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream 
     let mut done: Vec<String> = Vec::new();
     let mut ignored: Vec<&Variant> = Vec::new();
 
-    // quick run-through to get ignored variants and check for non-struct variants
+    // quick run-through to get wholly ignored variants and check for non-struct variants
     for variant in data.variants.iter() {
         let is_struct = match variant.fields {
             Fields::Named(_) => true,
@@ -203,7 +205,7 @@ fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream 
 
         if let Visited::Halted = visit_nested_attrs(&variant.attrs, |meta, _| match meta {
             NestedMeta::Meta(Meta::Word(ref ident)) => {
-                if ident == "ignore" {
+                if ident == "ignore_all" {
                     return Visit::Halt;
                 }
 
@@ -256,34 +258,36 @@ fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream 
 
                             let new_docs = iter_docs(&other_field.attrs);
 
-                            if let Visited::Halted = visit_nested_attrs(&other_field.attrs, |meta, _| match meta {
-                                NestedMeta::Meta(Meta::Word(ref ident)) => {
-                                    if ident == "clone" {
-                                        clonable = true;
-                                    } else if ident == "copy" {
-                                        copyable = true;
-                                    } else if ident == "ignore" {
-                                        return Visit::Halt;
-                                    }
+                            if let Visited::Halted =
+                                visit_nested_attrs(&other_field.attrs, |meta, _| match meta {
+                                    NestedMeta::Meta(Meta::Word(ref ident)) => {
+                                        if ident == "clone" {
+                                            clonable = true;
+                                        } else if ident == "copy" {
+                                            copyable = true;
+                                        } else if ident == "ignore" {
+                                            return Visit::Halt;
+                                        }
 
-                                    Visit::Continue
-                                }
-                                NestedMeta::Meta(Meta::NameValue(ref meta)) if meta.ident == "prefix" => {
-                                    if let Lit::Str(ref s) = meta.lit {
-                                        prefix = Some(s.value());
+                                        Visit::Continue
                                     }
+                                    NestedMeta::Meta(Meta::NameValue(ref meta)) if meta.ident == "prefix" => {
+                                        if let Lit::Str(ref s) = meta.lit {
+                                            prefix = Some(s.value());
+                                        }
 
-                                    Visit::Continue
-                                }
-                                NestedMeta::Meta(Meta::NameValue(ref meta)) if meta.ident == "rename" => {
-                                    if let Lit::Str(ref s) = meta.lit {
-                                        rename = Some(s.value());
+                                        Visit::Continue
                                     }
+                                    NestedMeta::Meta(Meta::NameValue(ref meta)) if meta.ident == "rename" => {
+                                        if let Lit::Str(ref s) = meta.lit {
+                                            rename = Some(s.value());
+                                        }
 
-                                    Visit::Continue
-                                }
-                                _ => Visit::Continue,
-                            }) {
+                                        Visit::Continue
+                                    }
+                                    _ => Visit::Continue,
+                                })
+                            {
                                 // Halted only if the field was set to ignore, to skip it
                                 done.push(field_ident);
 
@@ -304,7 +308,7 @@ fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream 
                 let flattened_type = flatten(ty);
 
                 copyable = copyable
-                    || flattened_type.as_ref().map(is_trivially_copyable).unwrap_or(false)
+                    || flattened_type.map(is_trivially_copyable).unwrap_or(false)
                     || is_trivially_copyable(ty);
 
                 let is_in_all = presence == num_variants;
@@ -351,7 +355,10 @@ fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream 
                     .filter_map(|variant| {
                         let v = &variant.ident;
 
-                        let has_binding = variant.fields.iter().any(|field| field.ident.as_ref() == Some(&ident));
+                        let has_binding = variant
+                            .fields
+                            .iter()
+                            .any(|field| field.ident.as_ref() == Some(&ident));
 
                         if !has_binding {
                             None
@@ -388,12 +395,12 @@ fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream 
                     .chain(iter::once(quote!(_ => { None },)))
                     .take(num_variants);
 
-                let field_name = rename.unwrap_or_else(|| field_ident.clone());
+                let field_name = rename.as_ref().unwrap_or_else(|| &field_ident);
 
-                let method = match (&enum_prefix, prefix) {
-                    (Some(ref e), Some(ref p)) => format!("{}{}{}", e, p, field_name),
-                    (Some(ref p), _) | (_, Some(ref p)) => format!("{}{}", p, field_name),
-                    _ => field_name,
+                let method: Cow<str> = match (&enum_prefix, prefix) {
+                    (Some(ref e), Some(ref p)) => format!("{}{}{}", e, p, field_name).into(),
+                    (Some(ref p), _) | (_, Some(ref p)) => format!("{}{}", p, field_name).into(),
+                    _ => field_name.as_str().into(),
                 };
 
                 let method_ident = Ident::new(&method, Span::call_site());
@@ -413,7 +420,11 @@ fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream 
         field_accessors.into_iter()
     });
 
-    let is_variants = data.variants.iter().filter(|v| !ignored.contains(&v)).map(|variant| {
+    let is_variants = data.variants.iter().filter_map(|variant| {
+        if ignored.contains(&variant) {
+            return None;
+        }
+
         let v = &variant.ident;
 
         let mut variant_name = v.to_string().to_lowercase();
@@ -422,19 +433,32 @@ fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream 
 
         let vis = parse_visibility(&variant.attrs, enum_vis.clone(), inherited_vis.clone());
 
-        visit_nested_attrs(&variant.attrs, |meta, _| match meta {
+        if let Visited::Halted = visit_nested_attrs(&variant.attrs, |meta, _| match meta {
             NestedMeta::Meta(Meta::NameValue(ref meta)) if meta.ident == "prefix" => {
                 if let Lit::Str(ref s) = meta.lit {
                     prefix = Some(s.value());
                 }
+
+                Visit::Continue
             }
             NestedMeta::Meta(Meta::NameValue(ref meta)) if meta.ident == "rename" => {
                 if let Lit::Str(ref s) = meta.lit {
                     variant_name = s.value();
                 }
+
+                Visit::Continue
             }
-            _ => (),
-        });
+            NestedMeta::Meta(Meta::Word(ref ident)) => {
+                if ident == "ignore" {
+                    return Visit::Halt;
+                }
+
+                Visit::Continue
+            }
+            _ => Visit::Continue,
+        }) {
+            return None;
+        }
 
         let doc = Lit::new(Literal::string(&format!(
             "Returns true if the enum is variant [`{0}`](#variant.{0})",
@@ -457,7 +481,7 @@ fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream 
 
         let method = Ident::new(&method, Span::call_site());
 
-        quote! {
+        Some(quote! {
             #[doc = #doc]
             #extra_doc_space
             #first_variant_doc
@@ -469,7 +493,7 @@ fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream 
                     _ => { false },
                 }
             }
-        }
+        })
     });
 
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
@@ -515,7 +539,10 @@ fn visit_attrs<V: Into<Visit>>(attrs: &[Attribute], mut f: impl FnMut(&Meta, &At
     Visited::Completed
 }
 
-fn visit_nested_attrs<V: Into<Visit>>(attrs: &[Attribute], mut f: impl FnMut(&NestedMeta, &Attribute) -> V) -> Visited {
+fn visit_nested_attrs<V: Into<Visit>>(
+    attrs: &[Attribute],
+    mut f: impl FnMut(&NestedMeta, &Attribute) -> V,
+) -> Visited {
     visit_attrs(attrs, |meta, attr| match meta {
         Meta::List(ref meta_list) if meta_list.ident == "access" => {
             for meta in &meta_list.nested {
@@ -580,7 +607,7 @@ fn parse_visibility(
     vis
 }
 
-fn flatten(ty: &Type) -> Option<Type> {
+fn flatten(ty: &Type) -> Option<&Type> {
     match ty {
         Type::Path(TypePath { ref path, .. }) => {
             let fully_qualified = syn::parse_str::<Path>("::std::option::Option").unwrap();
@@ -602,7 +629,7 @@ fn flatten(ty: &Type) -> Option<Type> {
                 match outer_type.value().arguments {
                     PathArguments::AngleBracketed(AngleBracketedGenericArguments { ref args, .. }) => {
                         match args.first().unwrap().value() {
-                            GenericArgument::Type(ref ty) => Some(ty.clone()),
+                            GenericArgument::Type(ref ty) => Some(ty),
                             _ => None,
                         }
                     }
