@@ -84,12 +84,12 @@ fn impl_struct_auto_accessor(input: &DeriveInput, data: &DataStruct) -> TokenStr
 
         if let Visited::Halted = visit_nested_attrs(&field.attrs, |meta, _| match meta {
             NestedMeta::Meta(Meta::Word(ref ident)) => {
-                if ident == "clone" {
+                if ident == "ignore" {
+                    return Visit::Halt;
+                } else if ident == "clone" {
                     clonable = true;
                 } else if ident == "copy" {
                     copyable = true;
-                } else if ident == "ignore" {
-                    return Visit::Halt;
                 }
 
                 Visit::Continue
@@ -236,6 +236,8 @@ fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream 
 
                 let mut clonable = false;
                 let mut copyable = false;
+                let mut default = false;
+                let mut init_with: Option<Path> = None;
 
                 let mut prefix = None;
 
@@ -261,12 +263,14 @@ fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream 
                             if let Visited::Halted =
                                 visit_nested_attrs(&other_field.attrs, |meta, _| match meta {
                                     NestedMeta::Meta(Meta::Word(ref ident)) => {
-                                        if ident == "clone" {
+                                        if ident == "ignore" {
+                                            return Visit::Halt;
+                                        } else if ident == "clone" {
                                             clonable = true;
                                         } else if ident == "copy" {
                                             copyable = true;
-                                        } else if ident == "ignore" {
-                                            return Visit::Halt;
+                                        } else if ident == "default" {
+                                            default = true;
                                         }
 
                                         Visit::Continue
@@ -274,6 +278,16 @@ fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream 
                                     NestedMeta::Meta(Meta::NameValue(ref meta)) if meta.ident == "prefix" => {
                                         if let Lit::Str(ref s) = meta.lit {
                                             prefix = Some(s.value());
+                                        }
+
+                                        Visit::Continue
+                                    }
+                                    NestedMeta::Meta(Meta::NameValue(ref meta))
+                                        if meta.ident == "default" =>
+                                    {
+                                        if let Lit::Str(ref s) = meta.lit {
+                                            init_with =
+                                                Some(syn::parse_str(&s.value()).expect("Invalid path"));
                                         }
 
                                         Visit::Continue
@@ -339,13 +353,26 @@ fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream 
                  * 8            Return Option<&T>
                  */
 
-                let ty = match (copyable || clonable, is_in_all, &flattened_type) {
+                let init = if default {
+                    Some(quote!(::std::default::Default::default()))
+                } else if let Some(init_with) = init_with {
+                    Some(quote!(#init_with()))
+                } else {
+                    None
+                };
+
+                let ty = match (copyable || clonable, is_in_all || init.is_some(), &flattened_type) {
                     (true, _, Some(ty)) => quote!(::std::option::Option<#ty>),
                     (false, _, Some(ty)) => quote!(::std::option::Option<&#ty>),
                     (true, true, None) => quote!(#ty),
                     (false, true, None) => quote!(&#ty),
                     (true, false, None) => quote!(::std::option::Option<#ty>),
                     (false, false, None) => quote!(::std::option::Option<&#ty>),
+                };
+
+                let fallthrough = match (copyable || clonable, is_in_all, &init) {
+                    (true, false, Some(ref init)) => quote!(_ => {#init}),
+                    _ => quote!(_ => {None}),
                 };
 
                 let body = data
@@ -365,26 +392,27 @@ fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream 
                         } else {
                             let borrow = if !copyable { quote!(ref) } else { quote!() };
 
-                            let body = match (copyable, clonable, is_in_all, &flattened_type) {
-                                // variant 1, 2 copy
-                                (true, _, _, Some(_)) => quote!(#ident),
-                                // variant 1, 2 clone
-                                (_, true, _, Some(_)) => quote!(#ident.clone()),
-                                // variant 3, 4
-                                (false, false, _, Some(_)) => quote!(#ident.as_ref()),
-                                // variant 5 copy
-                                (true, _, true, None) => quote!(#ident),
-                                // variant 5 clone
-                                (_, true, true, None) => quote!(#ident.clone()),
-                                // variant 6 copy
-                                (true, _, false, None) => quote!(Some(#ident)),
-                                // variant 6 clone
-                                (_, true, false, None) => quote!(Some(#ident.clone())),
-                                // variant 7
-                                (_, _, true, None) => quote!(#ident),
-                                // variant 8
-                                (_, _, false, None) => quote!(Some(#ident)),
-                            };
+                            let body =
+                                match (copyable, clonable, is_in_all || init.is_some(), &flattened_type) {
+                                    // variant 1, 2 copy
+                                    (true, _, _, Some(_)) => quote!(#ident),
+                                    // variant 1, 2 clone
+                                    (_, true, _, Some(_)) => quote!(#ident.clone()),
+                                    // variant 3, 4
+                                    (false, false, _, Some(_)) => quote!(#ident.as_ref()),
+                                    // variant 5 copy
+                                    (true, _, true, None) => quote!(#ident),
+                                    // variant 5 clone
+                                    (_, true, true, None) => quote!(#ident.clone()),
+                                    // variant 6 copy
+                                    (true, _, false, None) => quote!(Some(#ident)),
+                                    // variant 6 clone
+                                    (_, true, false, None) => quote!(Some(#ident.clone())),
+                                    // variant 7
+                                    (_, _, true, None) => quote!(#ident),
+                                    // variant 8
+                                    (_, _, false, None) => quote!(Some(#ident)),
+                                };
 
                             Some(quote!(#name::#v {#borrow #ident, ..} => {#body},))
                         }
@@ -392,7 +420,7 @@ fn impl_enum_auto_accessor(input: &DeriveInput, data: &DataEnum) -> TokenStream 
                     // if there were fewer bindings than variants,
                     // the return type will be optional, so we can
                     // automatically insert the fallthrough.
-                    .chain(iter::once(quote!(_ => { None },)))
+                    .chain(iter::once(fallthrough))
                     .take(num_variants);
 
                 let field_name = rename.as_ref().unwrap_or_else(|| &field_ident);

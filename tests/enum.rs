@@ -39,6 +39,8 @@ pub enum Test<T: Clone> {
         /// Three
         c: Option<String>,
         m: Option<i32>,
+        #[access(default)]
+        u: u32,
         #[access(rename = "aaaaaa")]
         a: i32,
         k: &'static str,
@@ -53,15 +55,26 @@ pub enum Test<T: Clone> {
     },
 }
 
+fn my_string() -> &'static str {
+    "Hello, World!"
+}
+
 #[derive(AutoAccessor)]
-#[access(vis = "")]
+#[access(vis = "pub")]
 pub enum Test2 {
     A {
         #[access(vis = "pub(crate)")]
         a: i32,
+        k: char,
+        #[access(default = "my_string")]
+        m: &'static str,
     },
     #[access(ignore_all)]
     B { a: i32 },
+    C {
+        #[access(default)]
+        k: char,
+    },
 }
 
 fn main() {}
